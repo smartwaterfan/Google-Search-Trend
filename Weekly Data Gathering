@@ -1,107 +1,85 @@
 #!/usr/bin/env python3
-# Peaks.py — read only the CSVs for the tickers below and list weeks with GST >= THRESHOLD
-# Input:  data/trends_csv_exports/<TICKER>.csv  (Week,<TICKER>,isPartial)
-# Output: output/gst_week_starts_2023_th80.csv
+# Weekly Data Gathering.py — fetch weekly Google Trends for tickers (US, 2023, Web Search).
+# Writes: data/trends_csv_exports/<TICKER>.csv with columns: Week,<TICKER>,isPartial
+# NOTE: retries=0 to avoid urllib3 v2 'method_whitelist' error inside pytrends.
 
 from __future__ import annotations
 from pathlib import Path
+import time, random
 import pandas as pd
+from pytrends.request import TrendReq
 
-# --- same tickers here (so AMD/ROKU are excluded) ---
+# -------- Settings --------
 TICKERS = [
     "AMC","GME","TSLA","NVDA","AAPL","NIO","PLTR",
     "RIVN","LCID","SOFI","META","BBBYQ","CVNA",
-    "SPCE","NKLA"
+    "SPCE","NKLA"  # <-- swapped in for AMD, ROKU
 ]
-
 YEAR = 2023
-THRESHOLD = 80
-CSV_DIR  = Path("data/trends_csv_exports")
-OUTFILE  = Path(f"output/gst_week_starts_{YEAR}_th{THRESHOLD}.csv")
+GEO = "US"      # United States
+GPROP = ""      # Web Search
+CATEGORY = 0    # All categories
 
-def _normalize_label(s: str) -> str:
-    s = s.strip()
-    s = s.split(":", 1)[0]
-    s = s.split("(", 1)[0]
-    return s.strip().lower()
+OUTDIR = Path("data/trends_csv_exports")
+OUTDIR.mkdir(parents=True, exist_ok=True)
 
-def _pick_value_column(df: pd.DataFrame, term: str) -> str | None:
-    cols = [c for c in df.columns if c.lower() not in {"week", "ispartial"}]
-    for c in cols:
-        if c.lower() == term.lower(): return c
-    tgt = _normalize_label(term)
-    for c in cols:
-        if _normalize_label(c) == tgt: return c
-    for c in cols:
-        if tgt in _normalize_label(c): return c
-    return cols[0] if cols else None
+# light pacing to reduce 429s
+BETWEEN_TICKERS = (2.0, 4.0)  # seconds jitter
+BATCH_SIZE      = 6
+BATCH_PAUSE_S   = 25
+HARD_429_SLEEP  = 60          # on 429, cool down ~60s
 
-def read_one(csv_path: Path, ticker: str) -> pd.DataFrame:
-    if not csv_path.exists():
-        print(f"[{ticker}] missing CSV: {csv_path.name}")
-        return pd.DataFrame()
-
-    df = pd.read_csv(csv_path, encoding="utf-8-sig")
-    if "Week" not in df.columns:
-        print(f"[{ticker}] malformed CSV (no 'Week'): {csv_path.name}")
-        return pd.DataFrame()
-
-    val_col = _pick_value_column(df, ticker)
-    if not val_col:
-        print(f"[{ticker}] could not find value column in {csv_path.name}")
-        return pd.DataFrame()
-
-    vals = pd.to_numeric(df[val_col].astype(str).replace("<1","0"), errors="coerce").fillna(0).round(0).astype(int)
-    weeks = pd.to_datetime(df["Week"], errors="coerce").dt.date
-    part  = (df["isPartial"].astype(str).str.lower().map({"true":True,"false":False}).fillna(False)
-             if "isPartial" in df.columns else pd.Series([False]*len(df)))
-
-    # limit to the target year
-    mask = (weeks >= pd.to_datetime(f"{YEAR}-01-01").date()) & (weeks <= pd.to_datetime(f"{YEAR}-12-31").date())
-    weeks, vals, part = weeks[mask], vals[mask], part[mask]
-
-    if len(weeks) == 0:
-        return pd.DataFrame()
-
-    series_max = int(vals.max())
-    has_100 = 1 if series_max == 100 else 0
-    keep = vals >= THRESHOLD
-    if keep.sum() == 0:
-        return pd.DataFrame()
-
-    return pd.DataFrame({
-        "ticker": ticker,
-        "week_start": weeks[keep].astype(str).values,
-        "gst_value": vals[keep].astype(int).values,
-        "is_partial": ["yes" if b else "no" for b in part[keep].astype(bool).values],
-        "csv_file": csv_path.name,
-        "value_column_used": val_col,
-        "series_max": series_max,
-        "has_100": has_100,
-        "year": YEAR
-    })
+def fetch_one(pt: TrendReq, term: str) -> pd.DataFrame:
+    """Return DataFrame like the site export: Week, <term>, isPartial (weekly for 2023/US/Web)."""
+    timeframe = f"{YEAR}-01-01 {YEAR}-12-31"
+    MAX_ATTEMPTS = 5
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            pt.build_payload([term], timeframe=timeframe, geo=GEO, gprop=GPROP, cat=CATEGORY)
+            df = pt.interest_over_time()
+            if df is None or df.empty or term not in df.columns:
+                raise RuntimeError("Empty result or missing term column")
+            return pd.DataFrame({
+                "Week": df.index.date,
+                term: df[term].astype(float).round(0).astype(int),
+                "isPartial": df["isPartial"].astype(bool)
+            })
+        except Exception as e:
+            msg = str(e).lower()
+            # on 429, hard sleep ~60s; else short backoff
+            pause = HARD_429_SLEEP if ("429" in msg or "too many" in msg or "rate" in msg) \
+                    else min(6, 2 * attempt) + random.uniform(0, 0.5)
+            print(f"[{term}] attempt {attempt} failed: {e} — sleeping {pause:.1f}s")
+            time.sleep(pause)
+    # all attempts failed → header-only frame
+    return pd.DataFrame(columns=["Week", term, "isPartial"])
 
 def main():
-    OUTFILE.parent.mkdir(parents=True, exist_ok=True)
-    rows = []
+    print(f"Fetching weekly Google Trends for {len(TICKERS)} tickers (US, {YEAR}, Web Search)…\n")
 
-    for tkr in TICKERS:
-        csv_path = CSV_DIR / f"{tkr}.csv"
-        df = read_one(csv_path, tkr)
-        if not df.empty:
-            rows.append(df)
+    # KEY: retries=0 to avoid urllib3 v2 incompat in pytrends
+    pt = TrendReq(hl="en-US", tz=0, timeout=(30, 60), retries=0, backoff_factor=0.0, requests_args={})
 
-    if not rows:
-        pd.DataFrame(columns=[
-            "ticker","week_start","gst_value","is_partial","csv_file",
-            "value_column_used","series_max","has_100","year"
-        ]).to_csv(OUTFILE, index=False, encoding="utf-8")
-        print(f"No peaks >= {THRESHOLD}; wrote header-only file to {OUTFILE}")
-        return
+    for i, term in enumerate(TICKERS, start=1):
+        path = OUTDIR / f"{term}.csv"
+        df = fetch_one(pt, term)
 
-    out = pd.concat(rows, ignore_index=True)
-    out.to_csv(OUTFILE, index=False, encoding="utf-8")
-    print(f"Wrote {len(out)} rows to {OUTFILE}")
+        if df.empty:
+            path.write_text(f"Week,{term},isPartial\n", encoding="utf-8")
+            print(f"[{term}] FAILED — wrote header-only CSV")
+        else:
+            df.to_csv(path, index=False, encoding="utf-8")
+            mx = int(df[term].max())
+            has100 = 1 if mx == 100 else 0
+            print(f"[{term}] wrote {len(df)} weeks → {path.name} (max={mx}, has_100={has100})")
+
+        # anti-burst pacing
+        time.sleep(random.uniform(*BETWEEN_TICKERS))
+        if i % BATCH_SIZE == 0:
+            print(f"— small batch pause ({BATCH_PAUSE_S}s) —")
+            time.sleep(BATCH_PAUSE_S)
+
+    print("\nDone. CSVs are in:", OUTDIR.resolve())
 
 if __name__ == "__main__":
     main()
