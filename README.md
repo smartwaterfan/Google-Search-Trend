@@ -74,8 +74,8 @@ Columns (simplified): Date, three “(raw)” columns, three matching “(%)” 
 Script: Combiner.py
 What it does: For every spike week (from step 3), look at a 3-week trading window (~15 trading days) centered on the week and record:
 
-Max Positive Excess Return (%) and the day index (1–15) where it occurred
-Non-negative streak length starting at that day (how long excess return stays ≥ 0)
+Max Positive Excess Return (%) and the day index (1–15) where it occurred,
+Non-negative streak length starting at that day (how long excess return stays ≥ 0),
 Also logs the Max Absolute Excess Return (%) (largest move by magnitude, sign kept)
 
 Output folder: Conjunction/
