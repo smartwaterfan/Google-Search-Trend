@@ -119,7 +119,7 @@ Why compare to SPY? Using excess returns removes “market-wide” moves (e.g., 
 
 
 
-Define a simple “live” attention jump (e.g., percent change vs a running median of prior weeks).
+Develop a trading strategy using a defined simple “live” attention jump (e.g., percent change vs a running median of prior weeks).
 Backtest simple rules with three “knobs”:
 Attention threshold (how big the jump must be),
 Entry delay (how many days to wait after the spike),
